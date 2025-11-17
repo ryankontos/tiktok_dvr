@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  tiktok-live-dvr:
+    build: .
+    container_name: tiktok-live-dvr
+    restart: unless-stopped
+
+    environment:
+      # REQUIRED: target TikTok username (without the @)
+      TLDVR_USERNAME: "bigbrotherau"
+
+      # DVR behaviour
+      TLDVR_SEGMENT_SECONDS: "900"          # 15-minute segments
+      TLDVR_AUTO_RESTART: "true"             # keep watching for new lives
+      TLDVR_POLL_INTERVAL: "60"              # seconds between offline checks
+      TLDVR_TEST_SECONDS: "10"                # >0 = test mode (no GDrive upload)
+      TLDVR_USE_TELEGRAM: "false"
+
+      # Timezone for naming (AEDT via Sydney)
+      TLDVR_TIMEZONE: "Australia/Sydney"
+
+      TLDVR_UPLOAD_TEST_SEGMENTS: "true"
+
+      # Google Drive via rclone
+      TLDVR_GDRIVE_REMOTE: "gdrive"          # the rclone remote you created
+      TLDVR_GDRIVE_FOLDER: "BBAU2025_Live_Feed_Archive"
+
+      # Retention
+      TLDVR_LOCAL_RETENTION_DAYS: "1"        # delete local mp4s older than 1 day
+      TLDVR_REMOTE_RETENTION_DAYS: "30"      # delete GDrive files older than 30 days
+
+      # Paths inside container
+      TLDVR_COOKIES_PATH: "/config/cookies.json"
+      TLDVR_OUTPUT_DIR: "/output"
+
+    volumes:
+      # Cookies from host -> container
+      - ./config:/config:ro
+
+      # Recordings from container -> host
+      - ./recordings:/output
+
