@@ -1,0 +1,13 @@
+# Secrets
+config/
+rclone/
+recordings/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Docker
+*.log
