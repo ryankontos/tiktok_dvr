@@ -26,9 +26,8 @@ services:
       TLDVR_GDRIVE_REMOTE: "gdrive"          # the rclone remote you created
       TLDVR_GDRIVE_FOLDER: "BBAU2025_Live_Feed_Archive"
 
-      # Retention
-      TLDVR_LOCAL_RETENTION_DAYS: "1"        # delete local mp4s older than 1 day
-      TLDVR_REMOTE_RETENTION_DAYS: "30"      # delete GDrive files older than 30 days
+      TLDVR_LOCAL_RETENTION_HOURS: "10"
+      TLDVR_REMOTE_RETENTION_DAYS: "99999"    
 
       # Paths inside container
       TLDVR_COOKIES_PATH: "/config/cookies.json"
