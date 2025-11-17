@@ -14,7 +14,7 @@ services:
       TLDVR_SEGMENT_SECONDS: "900"          # 15-minute segments
       TLDVR_AUTO_RESTART: "true"             # keep watching for new lives
       TLDVR_POLL_INTERVAL: "60"              # seconds between offline checks
-      TLDVR_TEST_SECONDS: "10"                # >0 = test mode (no GDrive upload)
+      TLDVR_TEST_SECONDS: "0"                # >0 = test mode (no GDrive upload)
       TLDVR_USE_TELEGRAM: "false"
 
       # Timezone for naming (AEDT via Sydney)
