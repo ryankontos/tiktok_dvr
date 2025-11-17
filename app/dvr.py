@@ -141,7 +141,8 @@ class DvrTikTokRecorder(TikTokRecorder):
         enable_upload=False,
         gdrive_remote=None,
         gdrive_folder="BBAU2025_Live_Feed_Archive",
-        local_retention_days=1,
+        local_retention_days=1.0,
+        local_retention_hours=None,
         remote_retention_days=30,
     ):
         super().__init__(
@@ -161,6 +162,7 @@ class DvrTikTokRecorder(TikTokRecorder):
         self.gdrive_remote = gdrive_remote
         self.gdrive_folder = gdrive_folder
         self.local_retention_days = local_retention_days
+        self.local_retention_hours = local_retention_hours
         self.remote_retention_days = remote_retention_days
 
     def _now(self) -> datetime:
@@ -228,21 +230,34 @@ class DvrTikTokRecorder(TikTokRecorder):
 
     def _cleanup_local_old_files(self) -> None:
         """
-        Delete local .mp4 files older than local_retention_days.
+        Delete local .mp4 files older than the configured retention.
+        Priority:
+          - If local_retention_hours is set (non-None), use that.
+          - Else use local_retention_days.
         """
-        try:
-            days = max(0, int(self.local_retention_days))
-        except Exception:
-            days = 1
+        # Determine retention in seconds
+        retention_seconds = 0.0
+        used_hours = False
 
-        if days <= 0:
+        try:
+            if self.local_retention_hours is not None:
+                hours = float(self.local_retention_hours)
+                if hours <= 0:
+                    return
+                retention_seconds = hours * 60 * 60
+                used_hours = True
+            else:
+                days = float(self.local_retention_days)
+                if days <= 0:
+                    return
+                retention_seconds = days * 24 * 60 * 60
+        except Exception:
+            # Fallback: don't delete anything if config is weird
+            logger.error("Invalid local retention value; skipping local cleanup.")
             return
 
-        cutoff_seconds = days * 24 * 60 * 60
         now_ts = time.time()
-
         base_dir = self.output or "."
-        # self.output is expected to be a directory path in our usage.
         for root, _, files in os.walk(base_dir):
             for name in files:
                 if not name.lower().endswith(".mp4"):
@@ -252,9 +267,16 @@ class DvrTikTokRecorder(TikTokRecorder):
                     mtime = os.path.getmtime(path)
                 except OSError:
                     continue
-                if now_ts - mtime > cutoff_seconds:
+                if now_ts - mtime > retention_seconds:
                     try:
-                        logger.info(f"Deleting local file older than {days} days: {path}")
+                        if used_hours:
+                            logger.info(
+                                f"Deleting local file older than {self.local_retention_hours} hours: {path}"
+                            )
+                        else:
+                            logger.info(
+                                f"Deleting local file older than {self.local_retention_days} days: {path}"
+                            )
                         os.remove(path)
                     except OSError as ex:
                         logger.error(f"Failed to delete local file {path}: {ex}")
@@ -423,6 +445,7 @@ def parse_args() -> argparse.Namespace:
       - TLDVR_GDRIVE_REMOTE
       - TLDVR_GDRIVE_FOLDER
       - TLDVR_LOCAL_RETENTION_DAYS
+      - TLDVR_LOCAL_RETENTION_HOURS
       - TLDVR_REMOTE_RETENTION_DAYS
       - TLDVR_UPLOAD_TEST_SEGMENTS
     """
@@ -522,9 +545,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--local-retention-days",
-        type=int,
-        help="Number of days to keep local recordings (default 1).",
-        default=int(get_env("TLDVR_LOCAL_RETENTION_DAYS", "1")),
+        type=float,
+        help="Number of days to keep local recordings (default 1). Ignored if local-retention-hours is set.",
+        default=float(get_env("TLDVR_LOCAL_RETENTION_DAYS", "1.0")),
+    )
+
+    parser.add_argument(
+        "--local-retention-hours",
+        type=float,
+        help="Number of hours to keep local recordings. If set, this overrides local-retention-days.",
+        default=None if get_env("TLDVR_LOCAL_RETENTION_HOURS") is None
+        else float(get_env("TLDVR_LOCAL_RETENTION_HOURS")),
     )
 
     parser.add_argument(
@@ -592,6 +623,7 @@ def make_recorder(args: argparse.Namespace) -> DvrTikTokRecorder:
         gdrive_remote=args.gdrive_remote,
         gdrive_folder=args.gdrive_folder,
         local_retention_days=args.local_retention_days,
+        local_retention_hours=args.local_retention_hours,
         remote_retention_days=args.remote_retention_days,
     )
 
