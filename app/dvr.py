@@ -286,6 +286,8 @@ class DvrTikTokRecorder(TikTokRecorder):
         Delete remote files older than remote_retention_days from Google Drive
         using rclone's --min-age filter.
         """
+        return
+
         if not self.enable_upload:
             return
         if not self.gdrive_remote or not self.gdrive_folder:
