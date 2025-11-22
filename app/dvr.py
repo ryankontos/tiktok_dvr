@@ -748,12 +748,29 @@ def main() -> None:
                 nice_name = f"{label}.mp4"
                 nice_path = seg_dir / nice_name
 
-                try:
-                    newest_mp4.rename(nice_path)
-                    log(cfg, f"Renamed {newest_mp4.name} -> {nice_path.name}")
-                except Exception as e:
-                    log_error(cfg, f"Failed to rename {newest_mp4} to {nice_path}: {e}")
-                    nice_path = newest_mp4  # fallback
+                # Always *attempt* to end up with a file named `nice_name`,
+                # so Drive never sees TK_* filenames in normal operation.
+                if newest_mp4.name != nice_name:
+                    try:
+                        newest_mp4.rename(nice_path)
+                        log(cfg, f"Renamed {newest_mp4.name} -> {nice_path.name}")
+                    except Exception as e:
+                        log_error(cfg, f"Failed to rename {newest_mp4} to {nice_path}: {e}")
+                        # Fallback: copy to the clean name, still upload that.
+                        try:
+                            shutil.copy2(newest_mp4, nice_path)
+                            log(cfg, f"Copied {newest_mp4.name} -> {nice_path.name} after rename failure")
+                        except Exception as e2:
+                            log_error(
+                                cfg,
+                                f"Failed to copy segment to clean name {nice_path}: {e2}. "
+                                f"Will upload original filename {newest_mp4.name}.",
+                            )
+                            nice_path = newest_mp4
+                else:
+                    # It already has the nice name
+                    log(cfg, f"Segment already named {nice_path.name}")
+                    nice_path = newest_mp4
 
                 last_segment_end = datetime.now(cfg.timezone)
                 set_last_segment_end(time.time())
@@ -770,7 +787,26 @@ def main() -> None:
                     last_upload_dt = datetime.now(cfg.timezone)
                     update_last_upload_time()
 
-                # Local cleanup only (remote never cleaned by script)
+                # Local cleanup: delete raw TK_* mp4 artefacts for this segment dir
+                try:
+                    for raw in seg_dir.glob("TK_*.mp4"):
+                        if raw != nice_path and raw.is_file():
+                            log(cfg, f"Deleting raw TK mp4 artefact: {raw}")
+                            try:
+                                raw.unlink()
+                            except Exception as e:
+                                log_error(cfg, f"Failed to delete raw TK mp4 file {raw}: {e}")
+                    for raw_flv in seg_dir.glob("TK_*_flv.mp4"):
+                        if raw_flv.is_file():
+                            log(cfg, f"Deleting raw FLV mp4 artefact: {raw_flv}")
+                            try:
+                                raw_flv.unlink()
+                            except Exception as e:
+                                log_error(cfg, f"Failed to delete raw FLV mp4 file {raw_flv}: {e}")
+                except Exception as e:
+                    log_error(cfg, f"Error while cleaning TK_* artefacts in {seg_dir}: {e}")
+
+                # Local age-based cleanup only (remote never cleaned by script)
                 cleanup_local_files(cfg)
 
                 write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="ok")
@@ -787,11 +823,23 @@ def main() -> None:
 
             if not cfg.auto_restart:
                 log(cfg, "Auto restart disabled; exiting after live finished.")
-                write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="stopped_no_autorestart")
+                write_heartbeat(
+                    cfg,
+                    last_segment_start,
+                    last_segment_end,
+                    last_upload_dt,
+                    status="stopped_no_autorestart",
+                )
                 return
 
             log(cfg, f"Waiting {cfg.poll_interval} seconds before checking if @{cfg.username} goes live again.")
-            write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="waiting_for_next_live")
+            write_heartbeat(
+                cfg,
+                last_segment_start,
+                last_segment_end,
+                last_upload_dt,
+                status="waiting_for_next_live",
+            )
             time.sleep(cfg.poll_interval)
 
         except KeyboardInterrupt:
