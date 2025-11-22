@@ -7,6 +7,7 @@ Features:
 - Auto restart when streamer goes live again
 - Local disk cleanup by age (hours)
 - Optional Google Drive upload via rclone
+- Startup catch-up upload of any cached recordings
 - Heartbeat file with last activity timestamps
 - Watchdog thread:
     - Discord alert + hard exit if no uploads in N minutes
@@ -14,7 +15,7 @@ Features:
     - Periodic status reports to Discord
 - Hard timeout around each recording segment to avoid permanent hangs
 - Nice filenames:
-    username - Fri 21/11/25, 22:00 - 22:15.mp4
+    Fri 21/11/25, 10:00pm - 10:15pm.mp4
 """
 
 import json
@@ -88,7 +89,6 @@ class Config:
     gdrive_folder: Optional[str]
 
     local_retention_hours: float
-    remote_retention_days: Optional[int]
 
     # Watchdog / reliability
     watchdog_upload_stall_minutes: int
@@ -129,8 +129,6 @@ class Config:
         gdrive_folder = env("TLDVR_GDRIVE_FOLDER")
 
         lrh = float(env("TLDVR_LOCAL_RETENTION_HOURS", "10"))
-        rrd = env("TLDVR_REMOTE_RETENTION_DAYS")
-        remote_retention_days = int(rrd) if rrd and int(rrd) > 0 else None
 
         watchdog_upload_stall_minutes = int(env("TLDVR_WATCHDOG_UPLOAD_STALL_MINUTES", "30"))
         memory_soft_limit_mb = int(env("TLDVR_MEMORY_SOFT_LIMIT_MB", "800"))
@@ -158,7 +156,6 @@ class Config:
             gdrive_remote=gdrive_remote,
             gdrive_folder=gdrive_folder,
             local_retention_hours=lrh,
-            remote_retention_days=remote_retention_days,
             watchdog_upload_stall_minutes=watchdog_upload_stall_minutes,
             memory_soft_limit_mb=memory_soft_limit_mb,
             segment_timeout_grace_seconds=segment_timeout_grace_seconds,
@@ -195,16 +192,17 @@ def notify_discord(
     """
     Send a notification to Discord.
 
-    channel:
-        "alert"  -> alerts / errors
-        "status" -> periodic heartbeat/status
+    - Alerts (failures, errors, watchdog restarts, etc.) -> alerts webhook
+    - Everything else (startup, normal uploads, status, catch-up) -> status webhook
 
-    If specific webhook for the channel is not set, falls back to the other.
+    If the relevant webhook URL is not set, the message is silently skipped.
+    No cross-fallback: status messages never go to the alerts channel, and
+    alert messages never go to the status channel.
     """
     if channel == "status":
-        webhook = cfg.discord_status_webhook_url or cfg.discord_alert_webhook_url
+        webhook = cfg.discord_status_webhook_url
     else:
-        webhook = cfg.discord_alert_webhook_url or cfg.discord_status_webhook_url
+        webhook = cfg.discord_alert_webhook_url
 
     if not webhook:
         return
@@ -309,12 +307,19 @@ def build_segment_paths(cfg: Config, start_dt: datetime) -> Tuple[Path, str]:
 
 def format_time_range_label(start_dt: datetime, end_dt: datetime) -> str:
     """
-    Fri 21/11/25, 22:00 - 22:15
+    Fri 21/11/25, 10:00pm - 10:15pm
     """
     day = start_dt.strftime("%a")  # Mon, Tue, ...
     date_part = start_dt.strftime("%d/%m/%y")  # 21/11/25
-    start_time = start_dt.strftime("%H:%M")
-    end_time = end_dt.strftime("%H:%M")
+
+    def fmt_12h(dt: datetime) -> str:
+        # 12-hour time with am/pm, no leading zero on hour.
+        t = dt.strftime("%I:%M%p")  # e.g. "01:05PM"
+        t = t.lstrip("0")           # "1:05PM"
+        return t.lower()            # "1:05pm"
+
+    start_time = fmt_12h(start_dt)
+    end_time = fmt_12h(end_dt)
     return f"{day} {date_part}, {start_time} - {end_time}"
 
 
@@ -345,29 +350,6 @@ def run_rclone_copy(cfg: Config, local_path: Path, remote_subdir: str) -> None:
             level="error",
             channel="alert",
         )
-
-
-def run_rclone_remote_cleanup(cfg: Config) -> None:
-    if not cfg.gdrive_remote or not cfg.gdrive_folder or cfg.remote_retention_days is None:
-        return
-
-    remote_root = f"{cfg.gdrive_remote}:{cfg.gdrive_folder}"
-    min_age = f"{cfg.remote_retention_days}d"
-    cmd = [
-        "rclone",
-        "delete",
-        remote_root,
-        "--min-age",
-        min_age,
-        "--log-level",
-        "INFO",
-    ]
-    log(cfg, f"Cleaning up remote files older than {cfg.remote_retention_days} days in {remote_root}")
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        log_error(cfg, f"rclone remote cleanup failed: {e}")
-        # Don't spam Discord on every failure; just log.
 
 
 def cleanup_local_files(cfg: Config) -> None:
@@ -403,6 +385,69 @@ def get_disk_usage_summary(path: Path) -> str:
         return f"{used_gb:.1f} / {total_gb:.1f} GiB used ({pct:.1f}%)"
     except Exception:
         return "unknown"
+
+
+def catch_up_pending_uploads(cfg: Config) -> None:
+    """
+    On startup, upload any existing recordings under output_dir to Google Drive.
+
+    This uses `rclone copy <local_root> <remote_root>` which is idempotent:
+    already-uploaded files are skipped based on size+mtime, so it's safe to
+    run on every start.
+
+    Respects:
+    - test mode (TLDVR_TEST_SECONDS & TLDVR_UPLOAD_TEST_SEGMENTS)
+    - missing GDrive config
+    """
+    if not cfg.gdrive_remote or not cfg.gdrive_folder:
+        log(cfg, "No GDrive remote configured; skipping startup catch-up upload.")
+        return
+
+    if cfg.test_seconds > 0 and not cfg.upload_test_segments:
+        log(cfg, "Test mode with uploads disabled; skipping startup catch-up upload.")
+        return
+
+    # Any recordings at all?
+    try:
+        has_files = any(cfg.output_dir.rglob("*.mp4"))
+    except Exception:
+        has_files = False
+
+    if not has_files:
+        log(cfg, "No local recordings found; nothing to catch up.")
+        return
+
+    local_root = cfg.output_dir
+    remote_root = f"{cfg.gdrive_remote}:{cfg.gdrive_folder}"
+
+    log(cfg, f"Running startup catch-up upload from {local_root} to {remote_root} ...")
+    cmd = ["rclone", "copy", str(local_root), remote_root, "--log-level", "INFO"]
+    try:
+        subprocess.run(cmd, check=True)
+        log(cfg, "Startup catch-up upload completed.")
+        update_last_upload_time()
+        notify_discord(
+            cfg,
+            f"DVR startup catch-up upload completed for @{cfg.username}.",
+            level="ok",
+            channel="status",
+        )
+    except FileNotFoundError:
+        log_error(cfg, "rclone not found in PATH; cannot perform startup catch-up upload.")
+        notify_discord(
+            cfg,
+            "DVR: rclone not found; startup catch-up upload skipped. Check system setup.",
+            level="error",
+            channel="alert",
+        )
+    except subprocess.CalledProcessError as e:
+        log_error(cfg, f"Startup rclone catch-up failed: {e}")
+        notify_discord(
+            cfg,
+            "DVR: startup catch-up upload failed; see server logs for details.",
+            level="error",
+            channel="alert",
+        )
 
 
 # ------------------------- Segment worker (child) ----------------------------
@@ -546,10 +591,6 @@ def main() -> None:
         )
     log(cfg, f"Auto restart after lives: {cfg.auto_restart}")
     log(cfg, f"Local retention: {cfg.local_retention_hours} hours")
-    if cfg.remote_retention_days is not None:
-        log(cfg, f"Remote retention: {cfg.remote_retention_days} days")
-    else:
-        log(cfg, "Remote retention: disabled")
 
     if cfg.discord_alert_webhook_url or cfg.discord_status_webhook_url:
         notify_discord(
@@ -558,6 +599,9 @@ def main() -> None:
             level="ok",
             channel="status",
         )
+
+    # Startup catch-up: upload any cached recordings that haven't made it to Drive.
+    catch_up_pending_uploads(cfg)
 
     cookies = load_cookies(cfg)
     api = TikTokAPI(proxy=None, cookies=cookies)
@@ -695,13 +739,13 @@ def main() -> None:
                         if not api.is_room_alive(room_id):
                             log(cfg, "User appears to be offline after empty segment.")
                             break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_error(cfg, f"Error while checking live status after empty segment: {e}")
                     time.sleep(5)
                     continue
 
-                # Rename to nice format
-                nice_name = f"{cfg.username} - {label}.mp4"
+                # 🔹 NEW NAME: no username, clean 12h time label
+                nice_name = f"{label}.mp4"
                 nice_path = seg_dir / nice_name
 
                 try:
@@ -726,12 +770,8 @@ def main() -> None:
                     last_upload_dt = datetime.now(cfg.timezone)
                     update_last_upload_time()
 
-                # Local cleanup
+                # Local cleanup only (remote never cleaned by script)
                 cleanup_local_files(cfg)
-
-                # Optional remote cleanup
-                if cfg.remote_retention_days is not None:
-                    run_rclone_remote_cleanup(cfg)
 
                 write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="ok")
 
