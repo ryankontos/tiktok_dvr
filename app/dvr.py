@@ -1,808 +1,776 @@
-import argparse
+#!/usr/bin/env python3
+"""
+TikTok Live DVR wrapper around Michele0303/tiktok-live-recorder.
+
+Features:
+- Segment-based recording (e.g. 15-minute chunks)
+- Auto restart when streamer goes live again
+- Local disk cleanup by age (hours)
+- Optional Google Drive upload via rclone
+- Heartbeat file with last activity timestamps
+- Watchdog thread:
+    - Discord alert + hard exit if no uploads in N minutes
+    - Optional memory soft-limit restart
+    - Periodic status reports to Discord
+- Hard timeout around each recording segment to avoid permanent hangs
+- Nice filenames:
+    username - Fri 21/11/25, 22:00 - 22:15.mp4
+"""
+
 import json
 import os
 import signal
-import sys
-import time
 import subprocess
-from datetime import datetime
-from http.client import HTTPException
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Tuple
+
 from zoneinfo import ZoneInfo
 
-from requests import RequestException
+import shutil
 
-# These imports come from the cloned tiktok-live-recorder repo inside the container
+# Optional memory guard
+try:
+    import psutil  # type: ignore
+except ImportError:  # pragma: no cover
+    psutil = None  # we just skip memory-based watchdog if unavailable
+
+import requests  # used for Discord webhook
+
+# Optional systemd integration (will be harmless if library is missing)
+try:
+    from systemd import daemon as sd_daemon  # type: ignore
+except ImportError:  # pragma: no cover
+    sd_daemon = None
+
+# --- Make tiktok-live-recorder importable ------------------------------------
+
+# Adjust this if you installed the recorder somewhere else.
+DEFAULT_TLR_SRC = "/opt/tiktok-live-recorder/src"
+if DEFAULT_TLR_SRC not in sys.path:
+    sys.path.append(DEFAULT_TLR_SRC)
+
+from core.tiktok_api import TikTokAPI
 from core.tiktok_recorder import TikTokRecorder
 from utils.enums import Mode
-from utils.logger_manager import logger
-from utils.custom_exceptions import LiveNotFound, TikTokRecorderError
+from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
+
+# ---------------------------------------------------------------------------
+
+APP_ROOT = Path(__file__).resolve().parent.parent  # /root/tiktok_dvr
+DEFAULT_OUTPUT_DIR = APP_ROOT / "recordings"
+HEARTBEAT_FILE = DEFAULT_OUTPUT_DIR / ".tldvr_heartbeat.json"
 
 
-def str_to_bool(value: str) -> bool:
+# ------------------------------ Config --------------------------------------
+
+
+@dataclass
+class Config:
+    username: str
+
+    segment_seconds: int
+    auto_restart: bool
+    poll_interval: int
+
+    test_seconds: int
+    upload_test_segments: bool
+
+    timezone: ZoneInfo
+    cookies_path: Path
+    output_dir: Path
+
+    gdrive_remote: Optional[str]
+    gdrive_folder: Optional[str]
+
+    local_retention_hours: float
+    remote_retention_days: Optional[int]
+
+    # Watchdog / reliability
+    watchdog_upload_stall_minutes: int
+    memory_soft_limit_mb: int
+    segment_timeout_grace_seconds: int
+
+    # Discord notifications
+    discord_alert_webhook_url: Optional[str]
+    discord_status_webhook_url: Optional[str]
+    status_report_minutes: int
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        def env(name: str, default: Optional[str] = None) -> Optional[str]:
+            return os.environ.get(name, default)
+
+        username = env("TLDVR_USERNAME")
+        if not username:
+            raise SystemExit("TLDVR_USERNAME must be set (TikTok username without @)")
+
+        segment_seconds = int(env("TLDVR_SEGMENT_SECONDS", "900"))
+        auto_restart = env("TLDVR_AUTO_RESTART", "true").lower() == "true"
+        poll_interval = int(env("TLDVR_POLL_INTERVAL", "60"))
+
+        test_seconds = int(env("TLDVR_TEST_SECONDS", "0"))
+        upload_test_segments = env("TLDVR_UPLOAD_TEST_SEGMENTS", "false").lower() == "true"
+
+        tz_name = env("TLDVR_TIMEZONE", "UTC")
+        try:
+            timezone = ZoneInfo(tz_name)
+        except Exception:
+            timezone = ZoneInfo("UTC")
+
+        cookies_path = Path(env("TLDVR_COOKIES_PATH", str(APP_ROOT / "config" / "cookies.json")))
+        output_dir = Path(env("TLDVR_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
+
+        gdrive_remote = env("TLDVR_GDRIVE_REMOTE")
+        gdrive_folder = env("TLDVR_GDRIVE_FOLDER")
+
+        lrh = float(env("TLDVR_LOCAL_RETENTION_HOURS", "10"))
+        rrd = env("TLDVR_REMOTE_RETENTION_DAYS")
+        remote_retention_days = int(rrd) if rrd and int(rrd) > 0 else None
+
+        watchdog_upload_stall_minutes = int(env("TLDVR_WATCHDOG_UPLOAD_STALL_MINUTES", "30"))
+        memory_soft_limit_mb = int(env("TLDVR_MEMORY_SOFT_LIMIT_MB", "800"))
+        segment_timeout_grace_seconds = int(env("TLDVR_SEGMENT_TIMEOUT_GRACE_SECONDS", "60"))
+
+        # Backwards compatible:
+        # - TLDVR_DISCORD_WEBHOOK_URL = original single webhook
+        # - TLDVR_DISCORD_ALERT_WEBHOOK_URL / TLDVR_DISCORD_STATUS_WEBHOOK_URL = split channels
+        base_webhook = env("TLDVR_DISCORD_WEBHOOK_URL")
+        alert_webhook = env("TLDVR_DISCORD_ALERT_WEBHOOK_URL") or base_webhook
+        status_webhook = env("TLDVR_DISCORD_STATUS_WEBHOOK_URL") or base_webhook
+
+        status_report_minutes = int(env("TLDVR_STATUS_REPORT_MINUTES", "60"))
+
+        return cls(
+            username=username,
+            segment_seconds=segment_seconds,
+            auto_restart=auto_restart,
+            poll_interval=poll_interval,
+            test_seconds=test_seconds,
+            upload_test_segments=upload_test_segments,
+            timezone=timezone,
+            cookies_path=cookies_path,
+            output_dir=output_dir,
+            gdrive_remote=gdrive_remote,
+            gdrive_folder=gdrive_folder,
+            local_retention_hours=lrh,
+            remote_retention_days=remote_retention_days,
+            watchdog_upload_stall_minutes=watchdog_upload_stall_minutes,
+            memory_soft_limit_mb=memory_soft_limit_mb,
+            segment_timeout_grace_seconds=segment_timeout_grace_seconds,
+            discord_alert_webhook_url=alert_webhook,
+            discord_status_webhook_url=status_webhook,
+            status_report_minutes=status_report_minutes,
+        )
+
+
+# ------------------------------ Logging -------------------------------------
+
+
+def _now_str(tz: ZoneInfo) -> str:
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(cfg: Config, msg: str) -> None:
+    print(f"[*] {_now_str(cfg.timezone)} - {msg}", flush=True)
+
+
+def log_error(cfg: Config, msg: str) -> None:
+    print(f"[!] {_now_str(cfg.timezone)} - {msg}", flush=True)
+
+
+# ---------------------------- Discord notify --------------------------------
+
+
+def notify_discord(
+    cfg: Config,
+    message: str,
+    level: str = "info",
+    channel: str = "alert",  # "alert" or "status"
+) -> None:
     """
-    Convert typical truthy / falsy strings to bool.
+    Send a notification to Discord.
+
+    channel:
+        "alert"  -> alerts / errors
+        "status" -> periodic heartbeat/status
+
+    If specific webhook for the channel is not set, falls back to the other.
     """
-    if isinstance(value, bool):
-        return value
-    value = value.strip().lower()
-    if value in {"1", "true", "yes", "y", "on"}:
-        return True
-    if value in {"0", "false", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Cannot interpret boolean value from: {value!r}")
+    if channel == "status":
+        webhook = cfg.discord_status_webhook_url or cfg.discord_alert_webhook_url
+    else:
+        webhook = cfg.discord_alert_webhook_url or cfg.discord_status_webhook_url
 
+    if not webhook:
+        return
 
-def get_env(name: str, default=None):
-    """
-    Read environment variable with a default.
-    """
-    return os.environ.get(name, default)
+    prefix = {
+        "info": "ℹ️",
+        "warn": "⚠️",
+        "error": "❌",
+        "ok": "✅",
+    }.get(level, "ℹ️")
 
-
-def load_cookies(path: str) -> dict:
-    """
-    Load and normalise cookies from a file.
-
-    Supported formats in cookies.json:
-
-    1) Simple dict:
-       { "session_ss": "VALUE" }
-
-    2) Raw JSON string containing just the value:
-       "VALUE"
-       -> treated as { "session_ss": "VALUE" }
-
-    3) JSON string with a cookie header:
-       "session_ss=VALUE; other=XYZ"
-       -> parsed into { "session_ss": "VALUE", "other": "XYZ" }
-
-    4) JSON list of objects (browser-style export):
-       [ { "name": "session_ss", "value": "VALUE" }, ... ]
-
-    5) Non-JSON fallback: plain text in the file:
-       - "VALUE" -> { "session_ss": "VALUE" }
-       - "session_ss=VALUE; other=XYZ" -> parsed into dict
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"cookies file not found: {path}")
-
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read().strip()
-
-    if not raw:
-        raise ValueError(f"cookies file is empty: {path}")
-
-    # Try JSON first
+    payload = {"content": f"{prefix} {message}"}
     try:
-        parsed = json.loads(raw)
+        resp = requests.post(webhook, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            log_error(cfg, f"Discord webhook returned HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:  # pragma: no cover
+        log_error(cfg, f"Failed to send Discord notification: {e}")
+
+
+# ----------------------------- Heartbeat ------------------------------------
+
+_last_upload_ts_lock = threading.Lock()
+_last_upload_ts: Optional[float] = None
+
+_last_segment_end_ts_lock = threading.Lock()
+_last_segment_end_ts: Optional[float] = None
+
+
+def update_last_upload_time() -> None:
+    global _last_upload_ts
+    with _last_upload_ts_lock:
+        _last_upload_ts = time.time()
+
+
+def set_last_segment_end(t: float) -> None:
+    global _last_segment_end_ts
+    with _last_segment_end_ts_lock:
+        _last_segment_end_ts = t
+
+
+HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def write_heartbeat(
+    cfg: Config,
+    last_segment_start: Optional[datetime],
+    last_segment_end: Optional[datetime],
+    last_upload: Optional[datetime],
+    status: str,
+) -> None:
+    try:
+        payload = {
+            "username": cfg.username,
+            "timezone": str(cfg.timezone),
+            "last_segment_start_iso": last_segment_start.isoformat() if last_segment_start else None,
+            "last_segment_end_iso": last_segment_end.isoformat() if last_segment_end else None,
+            "last_upload_iso": last_upload.isoformat() if last_upload else None,
+            "status": status,
+            "updated_at_iso": datetime.now(cfg.timezone).isoformat(),
+        }
+        HEARTBEAT_FILE.write_text(json.dumps(payload, indent=2))
+    except Exception as e:  # pragma: no cover
+        log_error(cfg, f"Failed to write heartbeat file: {e}")
+
+
+# ---------------------------- Helpers ---------------------------------------
+
+
+def load_cookies(cfg: Config) -> dict:
+    if not cfg.cookies_path.exists():
+        raise SystemExit(f"Cookies file not found: {cfg.cookies_path}")
+
+    raw = cfg.cookies_path.read_text().strip()
+    try:
+        data = json.loads(raw)
     except json.JSONDecodeError:
-        parsed = raw  # treat as plain string
+        # User pasted raw session cookie string; wrap it.
+        data = {"session_ss": raw}
 
-    # Case 1: already a dict
-    if isinstance(parsed, dict):
-        return parsed
+    if not isinstance(data, dict):
+        raise SystemExit("cookies.json must contain a JSON object or raw cookie string.")
 
-    # Case 2/3: parsed as a string
-    if isinstance(parsed, str):
-        s = parsed.strip()
-
-        # If no "=", assume it's just the session_ss value
-        if "=" not in s and ";" not in s:
-            return {"session_ss": s}
-
-        # Otherwise, parse as cookie header: "k=v; k2=v2"
-        cookies: dict[str, str] = {}
-        for chunk in s.split(";"):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if "=" in chunk:
-                k, v = chunk.split("=", 1)
-                cookies[k.strip()] = v.strip()
-        if cookies:
-            return cookies
-        raise ValueError(f"Could not parse cookies string from {path!r}")
-
-    # Case 4: list (e.g. browser export)
-    if isinstance(parsed, list):
-        cookies: dict[str, str] = {}
-        for item in parsed:
-            if isinstance(item, dict) and "name" in item and "value" in item:
-                cookies[item["name"]] = item["value"]
-        if cookies:
-            return cookies
-        raise ValueError(f"Unsupported cookies list structure in {path!r}")
-
-    raise ValueError(f"Unsupported cookies format in {path!r}: {type(parsed)}")
+    return data
 
 
-class DvrTikTokRecorder(TikTokRecorder):
+def ensure_output_dir(cfg: Config) -> None:
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def build_segment_paths(cfg: Config, start_dt: datetime) -> Tuple[Path, str]:
     """
-    Subclass of TikTokRecorder that:
-      - uses a custom filename format based on timezone
-      - stores recordings in per-date subfolders
-      - optionally uploads finished segments to Google Drive via rclone
-      - performs local and remote retention cleanup
+    Return (directory_path, date_subdir_name)
+
+    Directory: recordings/YYYY-MM-DD/
     """
+    date_dir = start_dt.date().isoformat()  # YYYY-MM-DD
+    dir_path = cfg.output_dir / date_dir
 
-    def __init__(
-        self,
-        url,
-        user,
-        room_id,
-        mode,
-        automatic_interval,
-        cookies,
-        proxy,
-        output,
-        duration,
-        use_telegram,
-        timezone_name="UTC",
-        enable_upload=False,
-        gdrive_remote=None,
-        gdrive_folder="BBAU2025_Live_Feed_Archive",
-        local_retention_days=1.0,
-        local_retention_hours=None,
-        remote_retention_days=30,
-    ):
-        super().__init__(
-            url=url,
-            user=user,
-            room_id=room_id,
-            mode=mode,
-            automatic_interval=automatic_interval,
-            cookies=cookies,
-            proxy=proxy,
-            output=output,
-            duration=duration,
-            use_telegram=use_telegram,
-        )
-        self.timezone_name = timezone_name
-        self.enable_upload = enable_upload
-        self.gdrive_remote = gdrive_remote
-        self.gdrive_folder = gdrive_folder
-        self.local_retention_days = local_retention_days
-        self.local_retention_hours = local_retention_hours
-        self.remote_retention_days = remote_retention_days
+    return dir_path, date_dir
 
-    def _now(self) -> datetime:
-        """
-        Get current time in the configured timezone.
-        """
-        try:
-            tz = ZoneInfo(self.timezone_name)
-        except Exception:
-            tz = ZoneInfo("UTC")
-        return datetime.now(tz)
 
-    def _format_base_filename(self, user: str, now: datetime) -> str:
-        """
-        Format base filename like:
-        username-Monday-25-Feb-2025-10:00am
-        """
-        weekday = now.strftime("%A")
-        day = now.strftime("%d").lstrip("0")
-        month = now.strftime("%b")  # Feb
-        year = now.strftime("%Y")
-        time_str = now.strftime("%I:%M%p").lstrip("0").lower()  # 10:00am
+def format_time_range_label(start_dt: datetime, end_dt: datetime) -> str:
+    """
+    Fri 21/11/25, 22:00 - 22:15
+    """
+    day = start_dt.strftime("%a")  # Mon, Tue, ...
+    date_part = start_dt.strftime("%d/%m/%y")  # 21/11/25
+    start_time = start_dt.strftime("%H:%M")
+    end_time = end_dt.strftime("%H:%M")
+    return f"{day} {date_part}, {start_time} - {end_time}"
 
-        safe_user = user.replace("@", "")
-        return f"{safe_user}-{weekday}-{day}-{month}-{year}-{time_str}"
 
-    def _upload_to_gdrive(self, final_mp4: str, now: datetime) -> None:
-        """
-        Upload the given file to Google Drive via rclone, into:
-          <remote>:<gdrive_folder>/<YYYY-MM-DD>/<filename>
-        """
-        if not self.enable_upload:
-            return
-        if not self.gdrive_remote or not self.gdrive_folder:
-            logger.info("GDrive upload enabled but remote/folder not configured; skipping upload.")
-            return
+def get_newest_mp4_in_dir(dir_path: Path, before: set[Path]) -> Optional[Path]:
+    after = set(p for p in dir_path.glob("*.mp4") if p.is_file())
+    new_files = list(after - before)
+    if not new_files:
+        return None
+    return max(new_files, key=lambda p: p.stat().st_mtime)
 
-        remote = self.gdrive_remote
-        date_folder = now.strftime("%Y-%m-%d")
-        filename = os.path.basename(final_mp4)
-        remote_path = f"{remote}:{self.gdrive_folder}/{date_folder}/{filename}"
 
-        try:
-            logger.info(f"Uploading {final_mp4} to Google Drive: {remote_path}")
-            subprocess.run(
-                [
-                    "rclone",
-                    "copyto",
-                    final_mp4,
-                    remote_path,
-                    "--transfers",
-                    "1",
-                    "--checkers",
-                    "2",
-                    "--log-level",
-                    "INFO",
-                ],
-                check=True,
-            )
-            logger.info("Upload to Google Drive completed.")
-        except FileNotFoundError:
-            logger.error("rclone not found inside container; cannot upload to Google Drive.")
-        except subprocess.CalledProcessError as ex:
-            logger.error(f"rclone upload failed: {ex}")
-
-    def _cleanup_local_old_files(self) -> None:
-        """
-        Delete local .mp4 files older than the configured retention.
-        Priority:
-          - If local_retention_hours is set (non-None), use that.
-          - Else use local_retention_days.
-        """
-        # Determine retention in seconds
-        retention_seconds = 0.0
-        used_hours = False
-
-        try:
-            if self.local_retention_hours is not None:
-                hours = float(self.local_retention_hours)
-                if hours <= 0:
-                    return
-                retention_seconds = hours * 60 * 60
-                used_hours = True
-            else:
-                days = float(self.local_retention_days)
-                if days <= 0:
-                    return
-                retention_seconds = days * 24 * 60 * 60
-        except Exception:
-            # Fallback: don't delete anything if config is weird
-            logger.error("Invalid local retention value; skipping local cleanup.")
-            return
-
-        now_ts = time.time()
-        base_dir = self.output or "."
-        for root, _, files in os.walk(base_dir):
-            for name in files:
-                if not name.lower().endswith(".mp4"):
-                    continue
-                path = os.path.join(root, name)
-                try:
-                    mtime = os.path.getmtime(path)
-                except OSError:
-                    continue
-                if now_ts - mtime > retention_seconds:
-                    try:
-                        if used_hours:
-                            logger.info(
-                                f"Deleting local file older than {self.local_retention_hours} hours: {path}"
-                            )
-                        else:
-                            logger.info(
-                                f"Deleting local file older than {self.local_retention_days} days: {path}"
-                            )
-                        os.remove(path)
-                    except OSError as ex:
-                        logger.error(f"Failed to delete local file {path}: {ex}")
-
-    def _cleanup_remote_old_files(self) -> None:
-        """
-        Delete remote files older than remote_retention_days from Google Drive
-        using rclone's --min-age filter.
-        """
+def run_rclone_copy(cfg: Config, local_path: Path, remote_subdir: str) -> None:
+    if not cfg.gdrive_remote or not cfg.gdrive_folder:
+        log(cfg, "GDrive remote/folder not configured; skipping upload.")
         return
 
-        if not self.enable_upload:
-            return
-        if not self.gdrive_remote or not self.gdrive_folder:
-            return
-
-        try:
-            days = max(0, int(self.remote_retention_days))
-        except Exception:
-            days = 30
-
-        if days <= 0:
-            return
-
-        remote = self.gdrive_remote
-        target = f"{remote}:{self.gdrive_folder}"
-        age_flag = f"{days}d"
-
-        try:
-            logger.info(f"Cleaning up remote files older than {days} days in {target}")
-            subprocess.run(
-                [
-                    "rclone",
-                    "delete",
-                    target,
-                    "--min-age",
-                    age_flag,
-                    "--log-level",
-                    "INFO",
-                ],
-                check=True,
-            )
-        except FileNotFoundError:
-            logger.error("rclone not found inside container; cannot clean up Google Drive.")
-        except subprocess.CalledProcessError as ex:
-            logger.error(f"rclone remote cleanup failed: {ex}")
-
-    def start_recording(self, user, room_id):
-        """
-        Start recording live, with custom filename and post-processing
-        (upload + cleanup).
-        This is based on the original TikTokRecorder.start_recording, with
-        filename/timezone adjustments and extra hooks.
-        """
-        live_url = self.tiktok.get_live_url(room_id)
-        if not live_url:
-            raise LiveNotFound("Failed to retrieve live URL.")
-
-        now = self._now()
-        base_name = self._format_base_filename(user, now)
-        date_folder = now.strftime("%Y-%m-%d")
-
-        # Build per-date directory under self.output
-        base_dir = self.output or ""
-        # Strip trailing slashes for os.path.join sanity
-        if base_dir.endswith("/") or base_dir.endswith("\\"):
-            base_dir = base_dir[:-1]
-
-        target_dir = os.path.join(base_dir, date_folder)
-        os.makedirs(target_dir, exist_ok=True)
-
-        output = os.path.join(target_dir, f"{base_name}_flv.mp4")
-
-        if self.duration:
-            logger.info(f"Started recording for {self.duration} seconds ")
-        else:
-            logger.info("Started recording...")
-
-        buffer_size = 512 * 1024  # 512 KB buffer
-        buffer = bytearray()
-
-        logger.info("[PRESS CTRL + C ONCE TO STOP]")
-        from utils.enums import Error, TimeOut  # local import to avoid circulars
-
-        with open(output, "wb") as out_file:
-            stop_recording = False
-            while not stop_recording:
-                try:
-                    if not self.tiktok.is_room_alive(room_id):
-                        logger.info("User is no longer live. Stopping recording.")
-                        break
-
-                    start_time = time.time()
-                    for chunk in self.tiktok.download_live_stream(live_url):
-                        buffer.extend(chunk)
-                        if len(buffer) >= buffer_size:
-                            out_file.write(buffer)
-                            buffer.clear()
-
-                        elapsed_time = time.time() - start_time
-                        if self.duration and elapsed_time >= self.duration:
-                            stop_recording = True
-                            break
-
-                except ConnectionError:
-                    if self.mode == Mode.AUTOMATIC:
-                        logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                        time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
-
-                except (RequestException, HTTPException):
-                    time.sleep(2)
-
-                except KeyboardInterrupt:
-                    logger.info("Recording stopped by user.")
-                    stop_recording = True
-
-                except Exception as ex:
-                    logger.error(f"Unexpected error: {ex}\n")
-                    stop_recording = True
-
-                finally:
-                    if buffer:
-                        out_file.write(buffer)
-                        buffer.clear()
-                    out_file.flush()
-
-        logger.info(f"Recording finished: {output}\n")
-        from utils.video_management import VideoManagement
-        from upload.telegram import Telegram
-
-        VideoManagement.convert_flv_to_mp4(output)
-
-        final_mp4 = output.replace("_flv.mp4", ".mp4")
-
-        if self.use_telegram:
-            Telegram().upload(final_mp4)
-
-        # Upload to Google Drive (if enabled) and perform cleanup
-        try:
-            self._upload_to_gdrive(final_mp4, now)
-        except Exception as ex:
-            logger.error(f"GDrive upload step failed: {ex}")
-
-        try:
-            self._cleanup_local_old_files()
-        except Exception as ex:
-            logger.error(f"Local cleanup step failed: {ex}")
-
-        try:
-            self._cleanup_remote_old_files()
-        except Exception as ex:
-            logger.error(f"Remote cleanup step failed: {ex}")
-
-
-def parse_args() -> argparse.Namespace:
-    """
-    Parse CLI arguments, using environment variables as defaults.
-    Environment variables (all optional):
-      - TLDVR_USERNAME
-      - TLDVR_COOKIES_PATH
-      - TLDVR_OUTPUT_DIR
-      - TLDVR_SEGMENT_SECONDS
-      - TLDVR_AUTO_RESTART
-      - TLDVR_POLL_INTERVAL
-      - TLDVR_TEST_SECONDS
-      - TLDVR_USE_TELEGRAM
-      - TLDVR_TIMEZONE
-      - TLDVR_GDRIVE_REMOTE
-      - TLDVR_GDRIVE_FOLDER
-      - TLDVR_LOCAL_RETENTION_DAYS
-      - TLDVR_LOCAL_RETENTION_HOURS
-      - TLDVR_REMOTE_RETENTION_DAYS
-      - TLDVR_UPLOAD_TEST_SEGMENTS
-    """
-    parser = argparse.ArgumentParser(
-        description="TikTok Live DVR wrapper around tiktok-live-recorder."
-    )
-
-    parser.add_argument(
-        "-u",
-        "--username",
-        help="TikTok username (without @). "
-             "Can also be set via TLDVR_USERNAME.",
-        default=get_env("TLDVR_USERNAME"),
-    )
-
-    parser.add_argument(
-        "--cookies-path",
-        help="Path to cookies.json inside the container. "
-             "Default: TLDVR_COOKIES_PATH or /config/cookies.json.",
-        default=get_env("TLDVR_COOKIES_PATH", "/config/cookies.json"),
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        help="Directory where recordings will be written. "
-             "Default: TLDVR_OUTPUT_DIR or /output.",
-        default=get_env("TLDVR_OUTPUT_DIR", "/output"),
-    )
-
-    parser.add_argument(
-        "--segment-seconds",
-        type=int,
-        help=(
-            "Segment length in seconds. "
-            "If > 0, each live is split into segments of this length. "
-            "If 0, record the entire live in one file. "
-            "Default: TLDVR_SEGMENT_SECONDS or 1800 (30 minutes)."
-        ),
-        default=int(get_env("TLDVR_SEGMENT_SECONDS", "1800")),
-    )
-
-    parser.add_argument(
-        "--auto-restart",
-        type=str_to_bool,
-        help=(
-            "If true, keep watching for new lives after one ends. "
-            "Default: TLDVR_AUTO_RESTART or true."
-        ),
-        default=str_to_bool(get_env("TLDVR_AUTO_RESTART", "true")),
-    )
-
-    parser.add_argument(
-        "--poll-interval",
-        type=int,
-        help=(
-            "Seconds between checks when user is not live. "
-            "Default: TLDVR_POLL_INTERVAL or 60."
-        ),
-        default=int(get_env("TLDVR_POLL_INTERVAL", "60")),
-    )
-
-    parser.add_argument(
-        "--test-seconds",
-        type=int,
-        help=(
-            "If > 0, run a single short recording of this many seconds "
-            "for testing, then exit. Default: TLDVR_TEST_SECONDS or 0."
-        ),
-        default=int(get_env("TLDVR_TEST_SECONDS", "0")),
-    )
-
-    parser.add_argument(
-        "--use-telegram",
-        type=str_to_bool,
-        help="If true, enable Telegram upload using telegram.json. "
-             "Default: TLDVR_USE_TELEGRAM or false.",
-        default=str_to_bool(get_env("TLDVR_USE_TELEGRAM", "false")),
-    )
-
-    parser.add_argument(
-        "--timezone",
-        help="IANA timezone name, e.g. Australia/Sydney.",
-        default=get_env("TLDVR_TIMEZONE", "UTC"),
-    )
-
-    parser.add_argument(
-        "--gdrive-remote",
-        help="rclone remote name for Google Drive (e.g. gdrive).",
-        default=get_env("TLDVR_GDRIVE_REMOTE"),
-    )
-
-    parser.add_argument(
-        "--gdrive-folder",
-        help="Google Drive folder name under the remote.",
-        default=get_env("TLDVR_GDRIVE_FOLDER", "BBAU2025_Live_Feed_Archive"),
-    )
-
-    parser.add_argument(
-        "--local-retention-days",
-        type=float,
-        help="Number of days to keep local recordings (default 1). Ignored if local-retention-hours is set.",
-        default=float(get_env("TLDVR_LOCAL_RETENTION_DAYS", "1.0")),
-    )
-
-    parser.add_argument(
-        "--local-retention-hours",
-        type=float,
-        help="Number of hours to keep local recordings. If set, this overrides local-retention-days.",
-        default=None if get_env("TLDVR_LOCAL_RETENTION_HOURS") is None
-        else float(get_env("TLDVR_LOCAL_RETENTION_HOURS")),
-    )
-
-    parser.add_argument(
-        "--remote-retention-days",
-        type=int,
-        help="Number of days to keep recordings on Google Drive (default 30).",
-        default=int(get_env("TLDVR_REMOTE_RETENTION_DAYS", "30")),
-    )
-
-    parser.add_argument(
-        "--upload-test-segments",
-        type=str_to_bool,
-        help=(
-            "If true, upload test segments (when test_seconds > 0) to Google Drive "
-            "as well. Default: TLDVR_UPLOAD_TEST_SEGMENTS or false."
-        ),
-        default=str_to_bool(get_env("TLDVR_UPLOAD_TEST_SEGMENTS", "false")),
-    )
-
-    args = parser.parse_args()
-
-    if not args.username:
-        parser.error(
-            "You must provide a TikTok username via --username or TLDVR_USERNAME."
-        )
-
-    return args
-
-
-def make_recorder(args: argparse.Namespace) -> DvrTikTokRecorder:
-    """
-    Create a DvrTikTokRecorder instance configured for a single user in MANUAL mode.
-    We do our own loop logic; we don't use TikTokRecorder.run().
-    """
-    output_dir = args.output_dir
-
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load and normalise cookies into a dict
-    cookies = load_cookies(args.cookies_path)
-
-    # automatic_interval in original code is in minutes; we won't use automatic_mode,
-    # but the constructor requires a value, so we pass something sane.
-    automatic_interval_minutes = max(1, args.poll_interval // 60) or 1
-
-    # Upload behaviour:
-    # - Normal run (test_seconds == 0): always upload.
-    # - Test run (test_seconds > 0): upload only if upload_test_segments is True.
-    enable_upload = (args.test_seconds == 0) or args.upload_test_segments
-
-    recorder = DvrTikTokRecorder(
-        url=None,
-        user=args.username,
-        room_id=None,
-        mode=Mode.MANUAL,
-        automatic_interval=automatic_interval_minutes,
-        cookies=cookies,
-        proxy=None,
-        output=output_dir,
-        duration=None,
-        use_telegram=args.use_telegram,
-        timezone_name=args.timezone,
-        enable_upload=enable_upload,
-        gdrive_remote=args.gdrive_remote,
-        gdrive_folder=args.gdrive_folder,
-        local_retention_days=args.local_retention_days,
-        local_retention_hours=args.local_retention_hours,
-        remote_retention_days=args.remote_retention_days,
-    )
-
-    return recorder
-
-
-def wait_until_live(recorder: TikTokRecorder, args: argparse.Namespace):
-    """
-    Poll until the user is live. Returns room_id if live, or None if we should stop
-    (e.g. auto_restart is False and user is not live on first check).
-    """
-    username = recorder.user
-    first_check = True
-
-    while True:
-        try:
-            room_id = recorder.tiktok.get_room_id_from_user(username)
-            if room_id and recorder.tiktok.is_room_alive(room_id):
-                recorder.room_id = room_id
-                logger.info(f"@{username} is live. room_id = {room_id}")
-                return room_id
-
-            logger.info(f"@{username} is not live.")
-
-            if not args.auto_restart:
-                # If this was just a one-shot run, don't wait forever.
-                if first_check:
-                    logger.info("auto_restart is disabled; exiting because user is offline.")
-                return None
-
-            first_check = False
-            logger.info(f"Waiting {args.poll_interval} seconds before checking again...")
-            time.sleep(args.poll_interval)
-
-        except TikTokRecorderError as ex:
-            logger.error(f"TikTokRecorderError while waiting for live: {ex}")
-            if not args.auto_restart:
-                return None
-            time.sleep(args.poll_interval)
-
-        except KeyboardInterrupt:
-            logger.info("Interrupted while waiting for live. Exiting.")
-            return None
-
-        except Exception as ex:
-            logger.error(f"Unexpected error while waiting for live: {ex}")
-            time.sleep(args.poll_interval)
-
-
-def run_test_mode(recorder: DvrTikTokRecorder, args: argparse.Namespace):
-    """
-    Run a short test recording for args.test_seconds, then exit.
-    Useful to verify Docker, cookies, FFmpeg, etc.
-    """
-    username = recorder.user
-    logger.info(
-        f"Starting TEST recording for @{username} for {args.test_seconds} seconds."
-    )
-
-    room_id = wait_until_live(recorder, args)
-    if not room_id:
-        logger.info("User is not live; aborting test run.")
-        return
-
+    remote_path = f"{cfg.gdrive_remote}:{cfg.gdrive_folder}/{remote_subdir}"
+    cmd = ["rclone", "copy", str(local_path), remote_path, "--log-level", "INFO"]
+    log(cfg, f"Uploading {local_path} to Google Drive: {remote_path}/{local_path.name}")
     try:
-        recorder.duration = args.test_seconds
-        recorder.start_recording(username, room_id)
-        logger.info("Test recording completed. Exiting.")
-    except KeyboardInterrupt:
-        logger.info("Test recording interrupted by user.")
-    except Exception as ex:
-        logger.error(f"Error during test recording: {ex}")
+        subprocess.run(cmd, check=True)
+        log(cfg, "Upload to Google Drive completed.")
+    except subprocess.CalledProcessError as e:
+        log_error(cfg, f"rclone upload failed: {e}")
+        notify_discord(
+            cfg,
+            f"DVR: rclone upload failed for `{local_path.name}`. Check logs on the server.",
+            level="error",
+            channel="alert",
+        )
 
 
-def run_dvr(recorder: DvrTikTokRecorder, args: argparse.Namespace):
+def run_rclone_remote_cleanup(cfg: Config) -> None:
+    if not cfg.gdrive_remote or not cfg.gdrive_folder or cfg.remote_retention_days is None:
+        return
+
+    remote_root = f"{cfg.gdrive_remote}:{cfg.gdrive_folder}"
+    min_age = f"{cfg.remote_retention_days}d"
+    cmd = [
+        "rclone",
+        "delete",
+        remote_root,
+        "--min-age",
+        min_age,
+        "--log-level",
+        "INFO",
+    ]
+    log(cfg, f"Cleaning up remote files older than {cfg.remote_retention_days} days in {remote_root}")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        log_error(cfg, f"rclone remote cleanup failed: {e}")
+        # Don't spam Discord on every failure; just log.
+
+
+def cleanup_local_files(cfg: Config) -> None:
     """
-    Main DVR loop:
-      - Wait for user to go live.
-      - Record either:
-          * one full live (no segmentation), or
-          * repeated segments of segment_seconds.
-      - If auto_restart is True, go back to waiting for the next live.
+    Delete local mp4s older than cfg.local_retention_hours.
     """
-    username = recorder.user
-    segment_seconds = args.segment_seconds
+    if cfg.local_retention_hours <= 0:
+        return
 
-    logger.info("Starting TikTok Live DVR loop.")
-    logger.info(f"Target username: @{username}")
-    logger.info(f"Output directory: {args.output_dir}")
-    logger.info(f"Segment length: {segment_seconds} seconds (0 = no segmentation).")
-    logger.info(f"Auto restart after lives: {args.auto_restart}")
+    cutoff = time.time() - cfg.local_retention_hours * 3600.0
+    for date_dir in cfg.output_dir.glob("*"):
+        if not date_dir.is_dir():
+            continue
+        for f in date_dir.glob("*.mp4"):
+            try:
+                mtime = f.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if mtime < cutoff:
+                log(cfg, f"Deleting local file older than {cfg.local_retention_hours} hours: {f}")
+                try:
+                    f.unlink()
+                except Exception as e:
+                    log_error(cfg, f"Failed to delete {f}: {e}")
+
+
+def get_disk_usage_summary(path: Path) -> str:
+    try:
+        du = shutil.disk_usage(str(path))
+        used_gb = du.used / (1024 ** 3)
+        total_gb = du.total / (1024 ** 3)
+        pct = du.used * 100.0 / du.total
+        return f"{used_gb:.1f} / {total_gb:.1f} GiB used ({pct:.1f}%)"
+    except Exception:
+        return "unknown"
+
+
+# ------------------------- Segment worker (child) ----------------------------
+
+
+def _segment_worker(
+    username: str,
+    room_id: Optional[str],
+    cookies: dict,
+    output_dir: str,
+    segment_seconds: int,
+) -> None:
+    """
+    Runs in a separate process so that if TikTokRecorder hangs,
+    the parent can kill this entire process without leaking resources.
+    """
+    try:
+        recorder = TikTokRecorder(
+            url=None,
+            user=username,
+            room_id=room_id,
+            mode=Mode.MANUAL,
+            automatic_interval=0,
+            cookies=cookies,
+            proxy=None,
+            output=output_dir,
+            duration=segment_seconds,
+            use_telegram=False,
+        )
+        recorder.manual_mode()
+    except (UserLiveError, LiveNotFound):
+        sys.exit(2)
+    except TikTokRecorderError:
+        sys.exit(3)
+    except Exception:
+        sys.exit(4)
+
+
+# ----------------------- Watchdog thread ------------------------------------
+
+
+def watchdog_loop(cfg: Config) -> None:
+    """
+    Background watchdog that:
+    - Alerts + force-exits if no uploads in N minutes.
+    - Optional memory guard.
+    - Periodic status reports to Discord.
+    - Sends systemd WATCHDOG notifications if available.
+    """
+    last_status_sent = 0.0
+    status_interval = cfg.status_report_minutes * 60 if cfg.status_report_minutes > 0 else None
 
     while True:
-        room_id = wait_until_live(recorder, args)
-        if room_id is None:
-            logger.info("No live to record; exiting DVR loop.")
-            return
+        time.sleep(60)
 
-        logger.info(f"Starting recording loop for @{username} (room_id {room_id}).")
+        now = time.time()
 
-        while True:
+        # Systemd watchdog heartbeat, if library present (harmless otherwise)
+        if sd_daemon is not None:  # pragma: no cover
             try:
-                if segment_seconds > 0:
-                    recorder.duration = segment_seconds
-                    logger.info(
-                        f"Recording new segment for up to {segment_seconds} seconds."
+                sd_daemon.notify("WATCHDOG=1")
+            except Exception:
+                pass
+
+        # Upload stall detection
+        with _last_upload_ts_lock:
+            lu = _last_upload_ts
+
+        if lu is not None:
+            stall_minutes = (now - lu) / 60.0
+            if stall_minutes > cfg.watchdog_upload_stall_minutes:
+                msg = (
+                    f"DVR watchdog: no successful upload for "
+                    f"{stall_minutes:.1f} minutes (threshold {cfg.watchdog_upload_stall_minutes}m). "
+                    "Assuming hang and restarting process."
+                )
+                log_error(cfg, msg)
+                notify_discord(cfg, msg, level="error", channel="alert")
+                os._exit(1)
+
+        # Memory guard
+        rss_mb = None
+        if psutil is not None:
+            try:
+                proc = psutil.Process(os.getpid())
+                rss_mb = proc.memory_info().rss / (1024 * 1024)
+                if rss_mb > cfg.memory_soft_limit_mb:
+                    msg = (
+                        f"DVR watchdog: memory usage {rss_mb:.1f} MB exceeds "
+                        f"soft limit {cfg.memory_soft_limit_mb} MB. Restarting process."
+                    )
+                    log_error(cfg, msg)
+                    notify_discord(cfg, msg, level="error", channel="alert")
+                    os._exit(1)
+            except Exception:
+                pass
+
+        # Periodic status report
+        if status_interval is not None and now - last_status_sent > status_interval:
+            with _last_upload_ts_lock:
+                lu = _last_upload_ts
+            with _last_segment_end_ts_lock:
+                se = _last_segment_end_ts
+
+            def fmt_age(ts: Optional[float]) -> str:
+                if ts is None:
+                    return "never"
+                minutes = (now - ts) / 60.0
+                return f"{minutes:.1f} min ago"
+
+            disk_summary = get_disk_usage_summary(cfg.output_dir)
+
+            msg = (
+                f"DVR status for @{cfg.username}: "
+                f"last upload: {fmt_age(lu)}, "
+                f"last segment end: {fmt_age(se)}, "
+                f"disk: {disk_summary}"
+            )
+            if rss_mb is not None:
+                msg += f", RSS: {rss_mb:.1f} MB"
+
+            notify_discord(cfg, msg, level="info", channel="status")
+            last_status_sent = now
+
+
+# ------------------------------ Main loop -----------------------------------
+
+
+def main() -> None:
+    cfg = Config.from_env()
+    ensure_output_dir(cfg)
+
+    log(cfg, f"USERNAME: @{cfg.username}")
+    log(cfg, f"Output directory: {cfg.output_dir}")
+    log(cfg, f"Segment length: {cfg.segment_seconds} seconds (0 = no segmentation).")
+    if cfg.test_seconds > 0:
+        log(
+            cfg,
+            f"TEST mode active: overriding segment length to {cfg.test_seconds} seconds; "
+            f"upload_test_segments={cfg.upload_test_segments}",
+        )
+    log(cfg, f"Auto restart after lives: {cfg.auto_restart}")
+    log(cfg, f"Local retention: {cfg.local_retention_hours} hours")
+    if cfg.remote_retention_days is not None:
+        log(cfg, f"Remote retention: {cfg.remote_retention_days} days")
+    else:
+        log(cfg, "Remote retention: disabled")
+
+    if cfg.discord_alert_webhook_url or cfg.discord_status_webhook_url:
+        notify_discord(
+            cfg,
+            f"DVR started for @{cfg.username} on host `{os.uname().nodename}`",
+            level="ok",
+            channel="status",
+        )
+
+    cookies = load_cookies(cfg)
+    api = TikTokAPI(proxy=None, cookies=cookies)
+
+    # Inform systemd we're ready (if using Type=notify; harmless otherwise)
+    if sd_daemon is not None:  # pragma: no cover
+        try:
+            sd_daemon.notify("READY=1")
+        except Exception:
+            pass
+
+    # Start watchdog thread
+    t = threading.Thread(target=watchdog_loop, args=(cfg,), daemon=True)
+    t.start()
+
+    last_segment_start: Optional[datetime] = None
+    last_segment_end: Optional[datetime] = None
+    last_upload_dt: Optional[datetime] = None
+
+    while True:
+        try:
+            # Resolve room id and check live
+            try:
+                room_id = api.get_room_id_from_user(cfg.username)
+            except Exception as e:
+                log_error(cfg, f"Failed to get room_id for @{cfg.username}: {e}")
+                notify_discord(
+                    cfg,
+                    f"DVR: failed to get room_id for @{cfg.username}: {e}",
+                    level="error",
+                    channel="alert",
+                )
+                time.sleep(cfg.poll_interval)
+                continue
+
+            if not room_id or not api.is_room_alive(room_id):
+                log(cfg, f"@{cfg.username} is not live.")
+                if not cfg.auto_restart:
+                    log(cfg, "Auto restart disabled; exiting.")
+                    write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="idle_offline")
+                    return
+                log(cfg, f"Waiting {cfg.poll_interval} seconds before recheck.")
+                write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="waiting_for_live")
+                time.sleep(cfg.poll_interval)
+                continue
+
+            log(cfg, f"@{cfg.username} is live. room_id = {room_id}")
+            log(cfg, "Starting TikTok Live DVR loop.")
+
+            # Inner loop: while live, record segment after segment.
+            while True:
+                # Determine actual duration for this segment
+                if cfg.test_seconds > 0:
+                    seg_seconds = cfg.test_seconds
+                else:
+                    seg_seconds = cfg.segment_seconds
+
+                seg_start = datetime.now(cfg.timezone)
+                seg_end = seg_start + timedelta(seconds=seg_seconds)
+                last_segment_start = seg_start
+
+                seg_dir, date_dir = build_segment_paths(cfg, seg_start)
+                seg_dir.mkdir(parents=True, exist_ok=True)
+
+                label = format_time_range_label(seg_start, seg_end)
+                log(cfg, f"Recording new segment for up to {seg_seconds} seconds. Label: {label}")
+
+                # Snapshot mp4s before segment
+                before_mp4s = set(p for p in seg_dir.glob("*.mp4") if p.is_file())
+
+                # Spawn worker process
+                from multiprocessing import Process
+
+                worker = Process(
+                    target=_segment_worker,
+                    args=(
+                        cfg.username,
+                        room_id,
+                        cookies,
+                        str(seg_dir) + os.sep,
+                        seg_seconds,
+                    ),
+                )
+                worker.start()
+
+                # Wait with hard timeout
+                max_wait = seg_seconds + cfg.segment_timeout_grace_seconds
+                log(cfg, f"Started recording for {seg_seconds} seconds (max wait {max_wait}s)")
+                log(cfg, "[PRESS CTRL + C ONCE TO STOP]")
+
+                worker.join(timeout=max_wait)
+
+                if worker.is_alive():
+                    # Hung – kill worker
+                    worker.terminate()
+                    worker.join(timeout=10)
+                    log_error(
+                        cfg,
+                        f"Recording worker exceeded max wait ({max_wait}s) and was terminated. "
+                        "This usually means TikTok or the network froze mid-segment.",
+                    )
+                    notify_discord(
+                        cfg,
+                        f"DVR: recording segment hung and had to be killed. "
+                        f"Username=@{cfg.username}, label={label}.",
+                        level="error",
+                        channel="alert",
+                    )
+                    write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="segment_hung")
+                    time.sleep(5)
+                    try:
+                        if not api.is_room_alive(room_id):
+                            log(cfg, "User appears to be offline after hung segment.")
+                            break
+                    except Exception:
+                        pass
+                    continue
+
+                # Worker exited; see if any mp4 appeared
+                newest_mp4 = get_newest_mp4_in_dir(seg_dir, before_mp4s)
+
+                if worker.exitcode not in (0, 2, 3, 4) and worker.exitcode is not None:
+                    log_error(cfg, f"Segment worker exited with unexpected code {worker.exitcode}.")
+                    notify_discord(
+                        cfg,
+                        f"DVR: segment worker exited with code {worker.exitcode} for @{cfg.username}.",
+                        level="error",
+                        channel="alert",
+                    )
+
+                if newest_mp4 is None:
+                    log_error(cfg, "No new mp4 file detected after segment. Skipping upload.")
+                    write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="segment_no_file")
+                    try:
+                        if not api.is_room_alive(room_id):
+                            log(cfg, "User appears to be offline after empty segment.")
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(5)
+                    continue
+
+                # Rename to nice format
+                nice_name = f"{cfg.username} - {label}.mp4"
+                nice_path = seg_dir / nice_name
+
+                try:
+                    newest_mp4.rename(nice_path)
+                    log(cfg, f"Renamed {newest_mp4.name} -> {nice_path.name}")
+                except Exception as e:
+                    log_error(cfg, f"Failed to rename {newest_mp4} to {nice_path}: {e}")
+                    nice_path = newest_mp4  # fallback
+
+                last_segment_end = datetime.now(cfg.timezone)
+                set_last_segment_end(time.time())
+
+                # Upload (optionally skip if test mode & not uploading tests)
+                if cfg.test_seconds > 0 and not cfg.upload_test_segments:
+                    log(
+                        cfg,
+                        f"TEST mode: not uploading segment {nice_path.name} to Google Drive "
+                        "(TLDVR_UPLOAD_TEST_SEGMENTS=false).",
                     )
                 else:
-                    recorder.duration = None
-                    logger.info("Recording full live (no segmentation).")
+                    run_rclone_copy(cfg, nice_path, date_dir)
+                    last_upload_dt = datetime.now(cfg.timezone)
+                    update_last_upload_time()
 
-                recorder.start_recording(username, room_id)
+                # Local cleanup
+                cleanup_local_files(cfg)
 
-            except LiveNotFound as ex:
-                logger.error(f"Live not found: {ex}")
-                break
+                # Optional remote cleanup
+                if cfg.remote_retention_days is not None:
+                    run_rclone_remote_cleanup(cfg)
 
-            except (ConnectionError, RequestException, HTTPException) as ex:
-                logger.error(f"Network error during recording: {ex}")
-                logger.info(f"Sleeping {args.poll_interval} seconds before retry.")
-                time.sleep(args.poll_interval)
+                write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="ok")
 
-            except KeyboardInterrupt:
-                logger.info("Recording interrupted by user. Exiting completely.")
+                # Check if still live before next segment
+                try:
+                    if not api.is_room_alive(room_id):
+                        log(cfg, "User is no longer live. Will handle according to AUTO_RESTART.")
+                        break
+                except Exception as e:
+                    log_error(cfg, f"Error while checking live status: {e}")
+
+            # end inner while (per-live-session loop)
+
+            if not cfg.auto_restart:
+                log(cfg, "Auto restart disabled; exiting after live finished.")
+                write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="stopped_no_autorestart")
                 return
 
-            except Exception as ex:
-                logger.error(f"Unexpected error during recording: {ex}")
-                logger.info(f"Sleeping {args.poll_interval} seconds before retry.")
-                time.sleep(args.poll_interval)
+            log(cfg, f"Waiting {cfg.poll_interval} seconds before checking if @{cfg.username} goes live again.")
+            write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="waiting_for_next_live")
+            time.sleep(cfg.poll_interval)
 
-            # After a segment (or full live) finishes:
-            if segment_seconds <= 0:
-                # No segmentation; we assume the live has ended or user stopped.
-                logger.info("Finished recording full live; leaving inner loop.")
-                break
-
-            # Segmented mode: check if the live is still ongoing
-            try:
-                if not recorder.tiktok.is_room_alive(room_id):
-                    logger.info("User is no longer live. Ending segment loop.")
-                    break
-                else:
-                    logger.info("User is still live. Starting next segment.")
-            except Exception as ex:
-                logger.error(f"Error while checking live status: {ex}")
-                break
-
-        if not args.auto_restart:
-            logger.info(
-                "auto_restart is disabled; stopping after this live."
-            )
+        except KeyboardInterrupt:
+            log(cfg, "Interrupted by user (Ctrl+C). Exiting DVR loop.")
+            write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="terminated_manual")
             return
-
-        logger.info(
-            f"Live ended. Waiting {args.poll_interval} seconds before "
-            "looking for the next live."
-        )
-        time.sleep(args.poll_interval)
-
-
-def main():
-    # Basic handling of SIGTERM for clean shutdown in Docker
-    def handle_sigterm(signum, frame):
-        logger.info("Received SIGTERM, shutting down.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
-    args = parse_args()
-    recorder = make_recorder(args)
-
-    if args.test_seconds > 0:
-        run_test_mode(recorder, args)
-    else:
-        run_dvr(recorder, args)
+        except Exception as e:
+            log_error(cfg, f"Unexpected error in main loop: {e}")
+            notify_discord(
+                cfg,
+                f"DVR: unexpected error in main loop: {e}",
+                level="error",
+                channel="alert",
+            )
+            write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="error_main_loop")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
+    # Make sure Ctrl+C actually kills us, not just children.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     main()
