@@ -10,12 +10,12 @@ Features:
 - Startup catch-up upload of any cached recordings
 - Heartbeat file with last activity timestamps
 - Watchdog thread:
-    - Discord alert + hard exit if no uploads in N minutes
+    - Discord alert + hard restart if no segments in N minutes while live
     - Optional memory soft-limit restart
     - Periodic status reports to Discord
 - Hard timeout around each recording segment to avoid permanent hangs
 - Nice filenames:
-    Fri 21/11/25, 10:00pm - 10:15pm.mp4
+    Mon 21/11 1:00am - 1:15am.mp4
 """
 
 import json
@@ -180,6 +180,23 @@ def log_error(cfg: Config, msg: str) -> None:
     print(f"[!] {_now_str(cfg.timezone)} - {msg}", flush=True)
 
 
+# ------------------------------ Restart helper ------------------------------
+
+
+def restart_self() -> None:
+    """
+    Hard-restart the current process in-place.
+
+    Used by the watchdog when it decides the process is wedged.
+    """
+    try:
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
+    except Exception:
+        # If execv fails for some reason, just exit.
+        os._exit(1)
+
+
 # ---------------------------- Discord notify --------------------------------
 
 
@@ -192,8 +209,8 @@ def notify_discord(
     """
     Send a notification to Discord.
 
-    - Alerts (failures, errors, watchdog restarts, etc.) -> alerts webhook
-    - Everything else (startup, normal uploads, status, catch-up) -> status webhook
+    - Alerts (failures, errors, watchdog restarts, recording start/stop, etc.) -> alerts webhook
+    - Everything else (startup, normal uploads, status, catch-up, segment start/end) -> status webhook
 
     If the relevant webhook URL is not set, the message is silently skipped.
     No cross-fallback: status messages never go to the alerts channel, and
@@ -223,13 +240,16 @@ def notify_discord(
         log_error(cfg, f"Failed to send Discord notification: {e}")
 
 
-# ----------------------------- Heartbeat ------------------------------------
+# ----------------------------- Heartbeat / state ----------------------------
 
 _last_upload_ts_lock = threading.Lock()
 _last_upload_ts: Optional[float] = None
 
 _last_segment_end_ts_lock = threading.Lock()
 _last_segment_end_ts: Optional[float] = None
+
+_is_live_lock = threading.Lock()
+_is_live: bool = False
 
 
 def update_last_upload_time() -> None:
@@ -242,6 +262,17 @@ def set_last_segment_end(t: float) -> None:
     global _last_segment_end_ts
     with _last_segment_end_ts_lock:
         _last_segment_end_ts = t
+
+
+def set_live_state(is_live: bool) -> None:
+    global _is_live
+    with _is_live_lock:
+        _is_live = is_live
+
+
+def get_live_state() -> bool:
+    with _is_live_lock:
+        return _is_live
 
 
 HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -307,10 +338,10 @@ def build_segment_paths(cfg: Config, start_dt: datetime) -> Tuple[Path, str]:
 
 def format_time_range_label(start_dt: datetime, end_dt: datetime) -> str:
     """
-    Fri 21/11/25, 10:00pm - 10:15pm
+    Mon 21/11 1:00am - 1:30am
     """
     day = start_dt.strftime("%a")  # Mon, Tue, ...
-    date_part = start_dt.strftime("%d/%m/%y")  # 21/11/25
+    date_part = start_dt.strftime("%d/%m")  # 21/11
 
     def fmt_12h(dt: datetime) -> str:
         # 12-hour time with am/pm, no leading zero on hour.
@@ -320,7 +351,7 @@ def format_time_range_label(start_dt: datetime, end_dt: datetime) -> str:
 
     start_time = fmt_12h(start_dt)
     end_time = fmt_12h(end_dt)
-    return f"{day} {date_part}, {start_time} - {end_time}"
+    return f"{day} {date_part} {start_time} - {end_time}"
 
 
 def get_newest_mp4_in_dir(dir_path: Path, before: set[Path]) -> Optional[Path]:
@@ -337,11 +368,24 @@ def run_rclone_copy(cfg: Config, local_path: Path, remote_subdir: str) -> None:
         return
 
     remote_path = f"{cfg.gdrive_remote}:{cfg.gdrive_folder}/{remote_subdir}"
-    cmd = ["rclone", "copy", str(local_path), remote_path, "--log-level", "INFO"]
+    cmd = [
+        "rclone",
+        "copy",
+        str(local_path),
+        remote_path,
+        "--log-level",
+        "INFO",
+    ]
     log(cfg, f"Uploading {local_path} to Google Drive: {remote_path}/{local_path.name}")
     try:
         subprocess.run(cmd, check=True)
         log(cfg, "Upload to Google Drive completed.")
+        notify_discord(
+            cfg,
+            f"Uploaded segment `{local_path.name}` to Google Drive (`{remote_subdir}`).",
+            level="ok",
+            channel="status",
+        )
     except subprocess.CalledProcessError as e:
         log_error(cfg, f"rclone upload failed: {e}")
         notify_discord(
@@ -492,7 +536,7 @@ def _segment_worker(
 def watchdog_loop(cfg: Config) -> None:
     """
     Background watchdog that:
-    - Alerts + force-exits if no uploads in N minutes.
+    - Alerts + force-restarts the process if no completed segments in N minutes while live.
     - Optional memory guard.
     - Periodic status reports to Discord.
     - Sends systemd WATCHDOG notifications if available.
@@ -512,21 +556,22 @@ def watchdog_loop(cfg: Config) -> None:
             except Exception:
                 pass
 
-        # Upload stall detection
-        with _last_upload_ts_lock:
-            lu = _last_upload_ts
+        # Segment stall detection (only when we believe we're live)
+        with _last_segment_end_ts_lock:
+            se = _last_segment_end_ts
 
-        if lu is not None:
-            stall_minutes = (now - lu) / 60.0
+        if get_live_state() and se is not None:
+            stall_minutes = (now - se) / 60.0
             if stall_minutes > cfg.watchdog_upload_stall_minutes:
                 msg = (
-                    f"DVR watchdog: no successful upload for "
-                    f"{stall_minutes:.1f} minutes (threshold {cfg.watchdog_upload_stall_minutes}m). "
+                    f"DVR watchdog: no completed segment for "
+                    f"{stall_minutes:.1f} minutes while live "
+                    f"(threshold {cfg.watchdog_upload_stall_minutes}m). "
                     "Assuming hang and restarting process."
                 )
                 log_error(cfg, msg)
                 notify_discord(cfg, msg, level="error", channel="alert")
-                os._exit(1)
+                restart_self()
 
         # Memory guard
         rss_mb = None
@@ -541,7 +586,7 @@ def watchdog_loop(cfg: Config) -> None:
                     )
                     log_error(cfg, msg)
                     notify_discord(cfg, msg, level="error", channel="alert")
-                    os._exit(1)
+                    restart_self()
             except Exception:
                 pass
 
@@ -564,6 +609,7 @@ def watchdog_loop(cfg: Config) -> None:
                 f"DVR status for @{cfg.username}: "
                 f"last upload: {fmt_age(lu)}, "
                 f"last segment end: {fmt_age(se)}, "
+                f"live: {get_live_state()}, "
                 f"disk: {disk_summary}"
             )
             if rss_mb is not None:
@@ -582,13 +628,24 @@ def main() -> None:
 
     log(cfg, f"USERNAME: @{cfg.username}")
     log(cfg, f"Output directory: {cfg.output_dir}")
-    log(cfg, f"Segment length: {cfg.segment_seconds} seconds (0 = no segmentation).")
+    log(cfg, f"Segment length: {cfg.segment_seconds} seconds (must be > 0 in normal mode).")
     if cfg.test_seconds > 0:
         log(
             cfg,
             f"TEST mode active: overriding segment length to {cfg.test_seconds} seconds; "
             f"upload_test_segments={cfg.upload_test_segments}",
         )
+    if cfg.test_seconds == 0 and cfg.segment_seconds <= 0:
+        raise SystemExit("TLDVR_SEGMENT_SECONDS must be > 0 when not in test mode.")
+
+    # Warn if watchdog stall is shorter than or comparable to segment length
+    if cfg.watchdog_upload_stall_minutes * 60 <= cfg.segment_seconds + cfg.segment_timeout_grace_seconds:
+        log_error(
+            cfg,
+            "WARNING: TLDVR_WATCHDOG_UPLOAD_STALL_MINUTES is shorter than or equal to "
+            "segment length + grace. This may cause false-positive watchdog restarts.",
+        )
+
     log(cfg, f"Auto restart after lives: {cfg.auto_restart}")
     log(cfg, f"Local retention: {cfg.local_retention_hours} hours")
 
@@ -620,10 +677,11 @@ def main() -> None:
     last_segment_start: Optional[datetime] = None
     last_segment_end: Optional[datetime] = None
     last_upload_dt: Optional[datetime] = None
+    set_live_state(False)
 
     while True:
         try:
-            # Resolve room id and check live
+            # Resolve room id
             try:
                 room_id = api.get_room_id_from_user(cfg.username)
             except Exception as e:
@@ -634,14 +692,39 @@ def main() -> None:
                     level="error",
                     channel="alert",
                 )
+                set_live_state(False)
                 time.sleep(cfg.poll_interval)
                 continue
 
-            if not room_id or not api.is_room_alive(room_id):
+            # Check live status (with error handling)
+            alive = False
+            if room_id:
+                try:
+                    alive = api.is_room_alive(room_id)
+                except Exception as e:
+                    log_error(cfg, f"Error while checking live status for @{cfg.username}: {e}")
+                    notify_discord(
+                        cfg,
+                        f"DVR: error checking live status for @{cfg.username}: {e}",
+                        level="warn",
+                        channel="status",
+                    )
+                    set_live_state(False)
+                    time.sleep(cfg.poll_interval)
+                    continue
+
+            if not room_id or not alive:
                 log(cfg, f"@{cfg.username} is not live.")
+                set_live_state(False)
                 if not cfg.auto_restart:
                     log(cfg, "Auto restart disabled; exiting.")
                     write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="idle_offline")
+                    notify_discord(
+                        cfg,
+                        f"DVR stopped for @{cfg.username}: streamer is offline and auto-restart is disabled.",
+                        level="warn",
+                        channel="alert",
+                    )
                     return
                 log(cfg, f"Waiting {cfg.poll_interval} seconds before recheck.")
                 write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="waiting_for_live")
@@ -649,6 +732,13 @@ def main() -> None:
                 continue
 
             log(cfg, f"@{cfg.username} is live. room_id = {room_id}")
+            set_live_state(True)
+            notify_discord(
+                cfg,
+                f"Recording started for @{cfg.username} (room_id={room_id}).",
+                level="ok",
+                channel="alert",
+            )
             log(cfg, "Starting TikTok Live DVR loop.")
 
             # Inner loop: while live, record segment after segment.
@@ -668,6 +758,12 @@ def main() -> None:
 
                 label = format_time_range_label(seg_start, seg_end)
                 log(cfg, f"Recording new segment for up to {seg_seconds} seconds. Label: {label}")
+                notify_discord(
+                    cfg,
+                    f"Segment started for @{cfg.username}: {label}",
+                    level="info",
+                    channel="status",
+                )
 
                 # Snapshot mp4s before segment
                 before_mp4s = set(p for p in seg_dir.glob("*.mp4") if p.is_file())
@@ -720,8 +816,23 @@ def main() -> None:
                         pass
                     continue
 
+                # Segment finished (worker exited normally)
+                last_segment_end = datetime.now(cfg.timezone)
+                set_last_segment_end(time.time())
+                notify_discord(
+                    cfg,
+                    f"Segment ended for @{cfg.username}: {label}",
+                    level="info",
+                    channel="status",
+                )
+
                 # Worker exited; see if any mp4 appeared
                 newest_mp4 = get_newest_mp4_in_dir(seg_dir, before_mp4s)
+
+                if newest_mp4 is None:
+                    # Give filesystem a moment and try again once
+                    time.sleep(3)
+                    newest_mp4 = get_newest_mp4_in_dir(seg_dir, before_mp4s)
 
                 if worker.exitcode not in (0, 2, 3, 4) and worker.exitcode is not None:
                     log_error(cfg, f"Segment worker exited with unexpected code {worker.exitcode}.")
@@ -734,6 +845,13 @@ def main() -> None:
 
                 if newest_mp4 is None:
                     log_error(cfg, "No new mp4 file detected after segment. Skipping upload.")
+                    notify_discord(
+                        cfg,
+                        f"DVR: segment finished but no mp4 file was produced for @{cfg.username} "
+                        f"(label={label}).",
+                        level="warn",
+                        channel="alert",
+                    )
                     write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="segment_no_file")
                     try:
                         if not api.is_room_alive(room_id):
@@ -744,7 +862,7 @@ def main() -> None:
                     time.sleep(5)
                     continue
 
-                # 🔹 NEW NAME: no username, clean 12h time label
+                # Clean filename: Day + DD/MM + clean 12h time label
                 nice_name = f"{label}.mp4"
                 nice_path = seg_dir / nice_name
 
@@ -772,15 +890,18 @@ def main() -> None:
                     log(cfg, f"Segment already named {nice_path.name}")
                     nice_path = newest_mp4
 
-                last_segment_end = datetime.now(cfg.timezone)
-                set_last_segment_end(time.time())
-
                 # Upload (optionally skip if test mode & not uploading tests)
                 if cfg.test_seconds > 0 and not cfg.upload_test_segments:
                     log(
                         cfg,
                         f"TEST mode: not uploading segment {nice_path.name} to Google Drive "
                         "(TLDVR_UPLOAD_TEST_SEGMENTS=false).",
+                    )
+                    notify_discord(
+                        cfg,
+                        f"Test mode: skipping upload of `{nice_path.name}` for @{cfg.username}.",
+                        level="info",
+                        channel="status",
                     )
                 else:
                     run_rclone_copy(cfg, nice_path, date_dir)
@@ -821,6 +942,14 @@ def main() -> None:
 
             # end inner while (per-live-session loop)
 
+            set_live_state(False)
+            notify_discord(
+                cfg,
+                f"Recording stopped for @{cfg.username}. Stream appears to be offline.",
+                level="warn",
+                channel="alert",
+            )
+
             if not cfg.auto_restart:
                 log(cfg, "Auto restart disabled; exiting after live finished.")
                 write_heartbeat(
@@ -844,7 +973,14 @@ def main() -> None:
 
         except KeyboardInterrupt:
             log(cfg, "Interrupted by user (Ctrl+C). Exiting DVR loop.")
+            set_live_state(False)
             write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="terminated_manual")
+            notify_discord(
+                cfg,
+                f"DVR terminated manually for @{cfg.username} (Ctrl+C).",
+                level="warn",
+                channel="alert",
+            )
             return
         except Exception as e:
             log_error(cfg, f"Unexpected error in main loop: {e}")
@@ -855,6 +991,7 @@ def main() -> None:
                 channel="alert",
             )
             write_heartbeat(cfg, last_segment_start, last_segment_end, last_upload_dt, status="error_main_loop")
+            # Leave some time before we hammer TikTok / ourselves again
             time.sleep(10)
 
 
