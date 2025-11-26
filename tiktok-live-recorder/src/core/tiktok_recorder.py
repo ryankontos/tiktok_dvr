@@ -197,7 +197,7 @@ class TikTokRecorder:
         Start recording live.
 
         If self.output is a string ending with ".mp4", it is treated as the
-        desired final MP4 path (e.g. ".../Mon 21/11 1:00am - 1:15am.mp4").
+        desired final MP4 path (e.g. ".../11:00am_to_11:30pm_Wed 22 Nov.mp4").
 
         In that case, we derive a temporary FLV path by inserting "_flv"
         before the extension and pass that to the VideoManagement helper.
@@ -217,7 +217,7 @@ class TikTokRecorder:
         final_mp4 = None
         if isinstance(self.output, str) and self.output:
             # Treat a value ending in .mp4 as a caller-supplied final name.
-            # Example: "/path/Mon 21/11 1:00am - 1:15am.mp4"
+            # Example: "/path/11:00am_to_11:30pm_Wed 22 Nov.mp4"
             if self.output.lower().endswith(".mp4"):
                 final_mp4 = self.output
 
@@ -225,8 +225,8 @@ class TikTokRecorder:
             # Caller controls the final name. We derive the temp FLV file by
             # inserting "_flv" before the extension:
             #
-            #   final_mp4 = ".../Mon 21/11 1:00am - 1:15am.mp4"
-            #   output    = ".../Mon 21/11 1:00am - 1:15am_flv.mp4"
+            #   final_mp4 = ".../11:00am_to_11:30pm_Wed 22 Nov.mp4"
+            #   output    = ".../11:00am_to_11:30pm_Wed 22 Nov_flv.mp4"
             #
             # VideoManagement.convert_flv_to_mp4(output) is then responsible
             # for producing final_mp4 (and typically deleting the FLV).

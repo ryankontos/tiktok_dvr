@@ -15,7 +15,7 @@ Features:
     - Periodic status reports to Discord
 - Hard timeout around each recording segment to avoid permanent hangs
 - Nice filenames (final, on-disk and uploaded):
-    Mon 21/11 1:00am - 1:15am.mp4
+    11:00am_to_11:30pm_Wed 22 Nov.mp4
 """
 
 import json
@@ -332,20 +332,23 @@ def build_segment_paths(cfg: Config, start_dt: datetime) -> Tuple[Path, str]:
 
 def format_time_range_label(start_dt: datetime, end_dt: datetime) -> str:
     """
-    Mon 21/11 1:00am - 1:30am
+    11:00am_to_11:30pm_Wed 22 Nov
     """
-    day = start_dt.strftime("%a")  # Mon, Tue, ...
-    date_part = start_dt.strftime("%d/%m")  # 21/11
-
     def fmt_12h(dt: datetime) -> str:
         # 12-hour time with am/pm, no leading zero on hour.
         t = dt.strftime("%I:%M%p")  # e.g. "01:05PM"
         t = t.lstrip("0")           # "1:05PM"
         return t.lower()            # "1:05pm"
 
-    start_time = fmt_12h(start_dt)
-    end_time = fmt_12h(end_dt)
-    return f"{day} {date_part} {start_time} - {end_time}"
+    start_time = fmt_12h(start_dt)  # e.g. "11:00am"
+    end_time = fmt_12h(end_dt)      # e.g. "11:30pm"
+
+    day_name = start_dt.strftime("%a")       # e.g. "Wed"
+    day_num = start_dt.strftime("%d").lstrip("0")  # "1".."31"
+    month_name = start_dt.strftime("%b")     # e.g. "Nov"
+
+    # Final format: 11:00am_to_11:30pm_Wed 22 Nov
+    return f"{start_time}_to_{end_time}_{day_name} {day_num} {month_name}"
 
 
 def run_rclone_copy(cfg: Config, local_path: Path, remote_subdir: str) -> None:
@@ -353,7 +356,7 @@ def run_rclone_copy(cfg: Config, local_path: Path, remote_subdir: str) -> None:
     Upload a finalised, nicely-named local_path to Google Drive.
 
     local_path.name will be like:
-        Mon 21/11 1:00am - 1:30am.mp4
+        11:00am_to_11:30pm_Wed 22 Nov.mp4
     """
     if not cfg.gdrive_remote or not cfg.gdrive_folder:
         log(cfg, "GDrive remote/folder not configured; skipping upload.")
@@ -505,7 +508,7 @@ def _segment_worker(
     Runs in a separate process.
 
     final_output_path is the desired final .mp4 file path, e.g.:
-        /.../recordings/2025-11-21/Mon 21/11 1:00am - 1:15am.mp4
+        /.../recordings/2025-11-21/11:00am_to_11:30pm_Wed 22 Nov.mp4
 
     TikTokRecorder (patched) will:
       - derive a temp FLV path internally,
@@ -945,3 +948,5 @@ if __name__ == "__main__":
     # Make sure Ctrl+C actually kills us, not just children.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     main()
+
+
